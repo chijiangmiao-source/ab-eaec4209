@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>导航审查 · 固定滞后平滑器</title>
+<style>
+  :root { --bg:#0f1420; --panel:#18203300; --line:#2a3450; --fg:#e6ecf8; --mut:#94a3c4;
+          --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --acc:#60a5fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background:#0f1420; color:var(--fg); }
+  header { padding:16px 22px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:14px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--mut); font-size:12px; }
+  main { padding:18px 22px; display:grid; grid-template-columns: 360px 1fr; gap:18px; }
+  .card { background:#151d31; border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:16px; }
+  .card h2 { font-size:14px; margin:0 0 10px; color:var(--acc); letter-spacing:.5px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
+  input { width:100%; background:#0f1626; border:1px solid var(--line); color:var(--fg);
+          border-radius:6px; padding:6px 8px; font-size:13px; }
+  input:focus { outline:none; border-color:var(--acc); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 10px; }
+  .grid4 { display:grid; grid-template-columns:repeat(4,1fr); gap:0 8px; }
+  button { background:var(--acc); color:#08101f; border:0; border-radius:6px; padding:8px 14px;
+           font-weight:600; cursor:pointer; margin-top:12px; }
+  button.ghost { background:#283450; color:var(--fg); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; }
+  .kv .k { color:var(--mut); }
+  .tag { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; font-weight:600; }
+  .tag.accepted { background:rgba(52,211,153,.15); color:var(--ok); }
+  .tag.replayed { background:rgba(251,191,36,.15); color:var(--warn); }
+  .tag.rejected { background:rgba(248,113,113,.15); color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { border-bottom:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; }
+  th { color:var(--mut); font-weight:600; position:sticky; top:0; background:#151d31; }
+  .scroll { max-height:340px; overflow:auto; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .err { color:var(--bad); font-size:12.5px; margin-top:8px; white-space:pre-wrap; }
+  .ok-msg { color:var(--ok); }
+  .frozen { color:var(--mut); }
+  .window-pt { color:var(--acc); }
+  .pill { font-size:11px; padding:0 7px; border-radius:99px; border:1px solid var(--line); color:var(--mut); }
+  svg { background:#0c1322; border-radius:8px; }
+  .legend { font-size:12px; color:var(--mut); margin-top:6px; }
+  .legend b { color:var(--fg); font-weight:600; }
+  #staleNote { display:none; font-size:12px; color:var(--warn); margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>导航审查 · 固定滞后平滑器</h1>
+  <span class="sub">延迟定位观测只重算固定滞后窗口内的历史后缀，已封存位置绝不改写</span>
+  <span style="flex:1"></span>
+  <span class="pill">修订 <b id="revPill">0</b></span>
+  <span class="pill" id="modePill">未建档</span>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>① 建立初值 / 噪声 / 滞后长度</h2>
+      <div class="grid2">
+        <div><label>初始位置 px</label><input id="cfgPx" type="number" step="any" value="0"></div>
+        <div><label>初始位置 py</label><input id="cfgPy" type="number" step="any" value="0"></div>
+      </div>
+      <div class="grid2">
+        <div><label>初始速度 vx</label><input id="cfgVx" type="number" step="any" value="1"></div>
+        <div><label>初始速度 vy</label><input id="cfgVy" type="number" step="any" value="0"></div>
+      </div>
+      <label>初始协方差对角线 [var px, var py, var vx, var vy]</label>
+      <div class="grid4">
+        <input id="cfgC0" type="number" step="any" value="1">
+        <input id="cfgC1" type="number" step="any" value="1">
+        <input id="cfgC2" type="number" step="any" value="0.1">
+        <input id="cfgC3" type="number" step="any" value="0.1">
+      </div>
+      <label>过程噪声强度 q（白噪声加速度，≥0）</label>
+      <input id="cfgQ" type="number" step="any" value="0.05">
+      <label>观测噪声 R（2×2 对称正定，三个数 a b c 表示 [[a,b],[b,c]]）</label>
+      <div class="grid4" style="grid-template-columns:1fr 1fr 1fr">
+        <input id="cfgRa" type="number" step="any" value="1">
+        <input id="cfgRb" type="number" step="any" value="0">
+        <input id="cfgRc" type="number" step="any" value="1">
+      </div>
+      <div class="grid2">
+        <div><label>滞后长度 L（时间单位）</label><input id="cfgLag" type="number" step="1" value="5"></div>
+        <div><label>初始时刻 t₀</label><input id="cfgT0" type="number" step="any" value="0"></div>
+      </div>
+      <button onclick="submitConfig()">建档 / 应用配置</button>
+      <button class="ghost" onclick="resetAll()">重置</button>
+      <div class="err" id="cfgErr"></div>
+    </div>
+
+    <div class="card">
+      <h2>② 按接收顺序录入观测（最多 32 条）</h2>
+      <label>稳定标识 stable_id（同标识同内容回放，内容不同拒绝）</label>
+      <input id="obsId" value="FIX-A">
+      <div class="grid2">
+        <div><label>采样时刻 t</label><input id="obsT" type="number" step="any" value="1"></div>
+      </div>
+      <div class="grid2">
+        <div><label>位置 x</label><input id="obsX" type="number" step="any" value="1"></div>
+        <div><label>位置 y</label><input id="obsY" type="number" step="any" value="0.2"></div>
+      </div>
+      <button id="obsBtn" onclick="submitObs()">录入观测</button>
+      <span class="pill" style="margin-left:8px">已录入 <b id="logCount">0</b>/32</span>
+      <div class="err" id="obsErr"></div>
+      <div id="staleNote">检测到旧修订响应，已阻止其覆盖最新页面（单调修订号守卫）。</div>
+    </div>
+
+    <div class="card">
+      <h2>③ 当前估计</h2>
+      <div class="kv">
+        <span class="k">修订号</span><span class="mono" id="curRev">0</span>
+        <span class="k">窗口左边界（封存点）</span><span class="mono" id="curLeft">—</span>
+        <span class="k">最新时刻</span><span class="mono" id="curLatest">—</span>
+        <span class="k">当前位置</span><span class="mono" id="curPos">—</span>
+        <span class="k">协方差对角线</span><span class="mono" id="curCov">—</span>
+        <span class="k">最近失败原因</span><span class="mono" id="curErr" style="color:var(--bad)">无</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>④ 已发布轨迹投影（修订号单调；封存点不可改写）</h2>
+      <svg id="plot" width="100%" height="240" viewBox="0 0 600 240"></svg>
+      <div class="legend">
+        <span style="color:var(--mut)">● 已封存</span>
+        <span style="color:var(--acc)">● 窗口内（迟到观测可重算此后的历史后缀）</span>
+      </div>
+      <div class="scroll" style="max-height:180px; margin-top:8px">
+        <table id="trajTable">
+          <thead><tr><th>修订</th><th>t</th><th>位置</th><th>速度</th><th>协方差对角</th><th>状态</th><th>标识</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>⑤ 不可变观测日志（逐条结论 / 当前位置 / 协方差对角 / 残差）</h2>
+      <div class="scroll">
+        <table id="logTable">
+          <thead><tr>
+            <th>#</th><th>标识</th><th>t</th><th>观测(x,y)</th><th>结论</th><th>修订</th>
+            <th>当前位置</th><th>协方差对角</th><th>残差</th><th>说明</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

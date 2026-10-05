@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""可执行验收服务 verify。
+
+执行三个阶段后退出，以退出码报告验收结果（0=全部通过，非 0=存在失败）：
+
+  1) 代码测试
+     - 迟到观测重放 / 同标识回放与拒绝 / 窗口外与非递增拒绝 / 封存不变量
+     - 重开恢复相同日志与轨迹
+     - 并发录入下旧结果抑制（后端单调修订 + 前端修订号守卫 Node 测试）
+  2) 构建检查：Python 编译、前端脚本语法、页面可交付要素齐全
+  3) 冒烟：启动真实 HTTP 服务，检查健康地址与业务 API/HTTP 路径，
+     并在本地模式下验证“重开恢复”；--base-url 时追加对已运行实例的冒烟。
+
+用法：
+  scripts/verify                      # 全流程（本地临时启动服务，端口自动选择）
+  scripts/verify --port 18080         # 指定本地冒烟端口
+  scripts/verify --base-url http://app:8080   # 额外冒烟已运行的 Compose 实例
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PY = sys.executable
+
+SMOKE_CFG = {
+    "initial_state": [0.0, 0.0, 1.0, 0.0],
+    "initial_cov": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0.1, 0], [0, 0, 0, 0.1]],
+    "process_noise": 0.05,
+    "measurement_noise": [[1.0, 0.0], [0.0, 1.0]],
+    "lag": 3,
+    "initial_timestamp": 0.0,
+}
+
+
+class Report:
+    def __init__(self) -> None:
+        self.failures: list[str] = []
+        self.steps = 0
+
+    def check(self, ok: bool, name: str, detail: str = "") -> bool:
+        self.steps += 1
+        mark = "✓" if ok else "✗"
+        print(f"  {mark} {name}" + (f" —— {detail}" if detail and not ok else ""))
+        if not ok:
+            self.failures.append(name + (f" ({detail})" if detail else ""))
+        return ok
+
+    def section(self, title: str) -> None:
+        print(f"\n=== {title} ===")
+
+    def section_result(self, title: str, ok: bool) -> None:
+        print(f"--- {title}: {'通过' if ok else '失败'} ---")
+
+
+def run(cmd: list[str], cwd: str = ROOT, env: dict | None = None) -> subprocess.CompletedProcess:
+    print("  $ " + " ".join(cmd))
+    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+
+
+# --------------------------------------------------------------------------- #
+# 阶段 1：代码测试
+# --------------------------------------------------------------------------- #
+
+def phase_code_tests(rep: Report) -> bool:
+    rep.section("阶段 1/3 代码测试（迟到重放 · 重开恢复 · 旧结果抑制）")
+
+    procp = run([PY, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"])
+    if procp.stdout:
+        print(procp.stdout)
+    if procp.stderr:
+        print(procp.stderr)
+    rep.check(procp.returncode == 0, "Python 单元/集成测试（含迟到重放、重开恢复、并发抑制）")
+
+    node = shutil_which("node")
+    if not node:
+        rep.check(False, "前端修订号守卫测试", "未找到 node（前端旧结果抑制测试需要 node）")
+    else:
+        procn = run([node, "tests/test_guard.js"])
+        if procn.stdout:
+            print(procn.stdout)
+        if procn.stderr:
+            print(procn.stderr)
+        rep.check(procn.returncode == 0, "前端单调修订号守卫测试（旧响应不得覆盖最新页面）")
+
+    ok = not rep.failures
+    rep.section_result("代码测试", ok)
+    return ok
+
+
+def shutil_which(name: str) -> str | None:
+    from shutil import which
+    return which(name)
+
+
+# --------------------------------------------------------------------------- #
+# 阶段 2：构建检查
+# --------------------------------------------------------------------------- #
+
+def phase_build(rep: Report) -> bool:
+    rep.section("阶段 2/3 构建检查（确认可交付页面）")
+
+    pyfiles = [os.path.join("app", "engine.py"), os.path.join("app", "server.py"),
+               os.path.join("scripts", "verify")]
+    procc = run([PY, "-m", "py_compile", *pyfiles])
+    rep.check(procc.returncode == 0, "Python 源码编译", procc.stderr.strip()[:300])
+
+    node = shutil_which("node")
+    js_ok = False
+    if node:
+        procj = run([node, "--check", os.path.join("app", "static", "app.js")])
+        js_ok = procj.returncode == 0
+        rep.check(js_ok, "前端 app.js 语法检查", procj.stderr.strip()[:300])
+    else:
+        rep.check(False, "前端 app.js 语法检查", "未找到 node")
+
+    html_path = os.path.join(ROOT, "app", "static", "index.html")
+    js_path = os.path.join(ROOT, "app", "static", "app.js")
+    with open(html_path, encoding="utf-8") as fh:
+        html = fh.read()
+    with open(js_path, encoding="utf-8") as fh:
+        js = fh.read()
+    markers = ["固定滞后平滑器", "/static/app.js", "logTable", "trajTable", "revPill"]
+    missing = [m for m in markers if m not in html]
+    rep.check(not missing, "页面包含建档/录入/日志/轨迹/修订号要素",
+              "缺失: " + ",".join(missing) if missing else "")
+    js_markers = ["createRevisionGuard", "/api/observations", "/api/state"]
+    missing_js = [m for m in js_markers if m not in js]
+    rep.check(not missing_js, "前端包含修订号守卫与业务 API 调用",
+              "缺失: " + ",".join(missing_js) if missing_js else "")
+
+    ok = not rep.failures
+    rep.section_result("构建检查", ok)
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+# 阶段 3：冒烟
+# --------------------------------------------------------------------------- #
+
+def http_get(url: str, timeout: float = 5.0):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status, r.read(), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), dict(e.headers)
+
+
+def http_post(url: str, obj: dict, timeout: float = 5.0):
+    data = json.dumps(obj).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+
+def wait_healthy(base: str, timeout_s: float = 20.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            status, body, _ = http_get(base + "/healthz", timeout=2)
+            if status == 200 and json.loads(body).get("status") == "ok":
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def smoke_business_api(base: str, rep: Report, prefix: str = "") -> dict | None:
+    p = prefix  # 日志前缀
+    code, body, _ = http_get(base + "/healthz")
+    health_ok = code == 200 and json.loads(body).get("status") == "ok"
+    rep.check(health_ok, f"{p}GET /healthz 健康响应", f"HTTP {code}")
+
+    code, body, headers = http_get(base + "/")
+    html = body.decode("utf-8", "replace")
+    page_ok = code == 200 and "固定滞后平滑器" in html and "/static/app.js" in html
+    rep.check(page_ok, f"{p}GET / 可交付页面", f"HTTP {code}")
+
+    code, body, _ = http_get(base + "/static/app.js")
+    rep.check(code == 200 and b"createRevisionGuard" in body,
+              f"{p}GET /static/app.js 静态资源", f"HTTP {code}")
+
+    code, state0, _ = http_get(base + "/api/state")
+    try:
+        state0 = json.loads(state0)
+    except json.JSONDecodeError:
+        state0 = {}
+    rep.check(code == 200 and "revision" in state0, f"{p}GET /api/state 状态投影", f"HTTP {code}")
+
+    code, cfg_resp = http_post(base + "/api/config", SMOKE_CFG)
+    if code != 200:
+        rep.check(False, f"{p}POST /api/config 建立初值/噪声/滞后长度",
+                  f"HTTP {code}: {cfg_resp.get('error')}")
+        return None
+    rep.check(True, f"{p}POST /api/config 建立初值/噪声/滞后长度")
+
+    # 非法噪声必须被拒绝（422），且保留原状
+    bad = dict(SMOKE_CFG, measurement_noise=[[1.0, 0.0], [0.0, -1.0]])
+    code, bad_resp = http_post(base + "/api/config", bad)
+    rep.check(code == 422 and "正定" in bad_resp.get("error", ""),
+              f"{p}非法观测噪声矩阵被拒绝并说明原因", f"HTTP {code} {bad_resp.get('error','')}")
+
+    # 顺序 4 条 + 1 条窗口内迟到
+    for i, t in enumerate([1, 2, 3, 4], start=1):
+        code, r = http_post(base + "/api/observations",
+                            {"stable_id": f"S{i}", "timestamp": t, "x": float(t), "y": 0.1 * i})
+        rep.check(code == 200 and r["decision"] == "accepted" and r["revision"] == i,
+                  f"{p}录入顺序观测 t={t}（接受，修订号 {i}）",
+                  f"HTTP {code} {r.get('decision')} rev={r.get('revision')}")
+
+    code, state_raw, _ = http_get(base + "/api/state")
+    state_before = json.loads(state_raw)
+    frozen_before = [pt["position"] for pt in state_before["trajectory"] if pt["frozen"]]
+
+    code, r = http_post(base + "/api/observations",
+                        {"stable_id": "SLATE", "timestamp": 2.5, "x": 2.5, "y": 0.3})
+    late_ok = (code == 200 and r["decision"] == "accepted" and r["revision"] == 5
+               and "重算窗口后缀" in r.get("reason", ""))
+    rep.check(late_ok, f"{p}迟到观测 t=2.5 被接受并重算窗口后缀",
+              f"HTTP {code} {r.get('decision')} {r.get('reason','')}")
+
+    code, state_raw, _ = http_get(base + "/api/state")
+    state_after = json.loads(state_raw)
+    frozen_after = [pt["position"] for pt in state_after["trajectory"] if pt["frozen"]]
+    win_ts = [pt["timestamp"] for pt in state_after["trajectory"] if not pt["frozen"]]
+    rep.check(frozen_before == frozen_after,
+              f"{p}迟到观测后已封存位置逐位不变",
+              f"{frozen_before} != {frozen_after}")
+    rep.check(2.5 in win_ts and win_ts == sorted(win_ts),
+              f"{p}迟到点按采样时刻插入窗口后缀 {win_ts}")
+
+    # 同标识同内容回放
+    code, r = http_post(base + "/api/observations",
+                        {"stable_id": "SLATE", "timestamp": 2.5, "x": 2.5, "y": 0.3})
+    rep.check(code == 200 and r["decision"] == "replayed" and r["revision"] == 0,
+              f"{p}同标识同内容回放原结论（不产生新修订）", f"HTTP {code} {r.get('decision')}")
+
+    # 同标识内容不同 -> 拒绝 409
+    code, r = http_post(base + "/api/observations",
+                        {"stable_id": "SLATE", "timestamp": 2.5, "x": 2.5, "y": 9.0})
+    rep.check(code == 409 and r["decision"] == "rejected",
+              f"{p}同标识内容不同被拒绝", f"HTTP {code}")
+
+    # 窗口外观测 -> 拒绝 409，轨迹不变
+    traj_before = state_after["trajectory"]
+    code, r = http_post(base + "/api/observations",
+                        {"stable_id": "SOLD", "timestamp": 0.5, "x": 0.0, "y": 0.0})
+    rep.check(code == 409 and r["decision"] == "rejected" and "窗口外" in r.get("reason", ""),
+              f"{p}窗口外观测被拒绝并说明原因", f"HTTP {code} {r.get('reason','')}")
+
+    # 同刻非递增（已封存槽位 t=1）
+    code, r = http_post(base + "/api/observations",
+                        {"stable_id": "SSAME", "timestamp": 1, "x": 8.0, "y": 8.0})
+    rep.check(code == 409 and r["decision"] == "rejected" and "同刻非递增" in r.get("reason", ""),
+              f"{p}同刻非递增顺序被拒绝", f"HTTP {code} {r.get('reason','')}")
+
+    code, state_raw, _ = http_get(base + "/api/state")
+    state_final = json.loads(state_raw)
+    rep.check(state_final["revision"] == 5,
+              f"{p}拒绝/回放均不推进修订号（最终修订号=5，实际 {state_final['revision']}）")
+    rep.check(state_final["trajectory"] != [] and
+              traj_before[0]["position"] == state_final["trajectory"][0]["position"],
+              f"{p}已发布轨迹在拒绝后保持不变")
+    rep.check([e["seq"] for e in state_final["log"]] == list(range(1, len(state_final["log"]) + 1)),
+              f"{p}不可变日志按接收顺序连续编号")
+
+    code, traj_raw, _ = http_get(base + "/api/trajectory")
+    try:
+        traj_resp = json.loads(traj_raw)
+    except json.JSONDecodeError:
+        traj_resp = {}
+    rep.check(code == 200 and len(traj_resp.get("trajectory", [])) == len(state_final["trajectory"]),
+              f"{p}GET /api/trajectory 轨迹投影")
+    return state_final
+
+
+def start_local_server(port: int, store: str, log_path: str):
+    logf = open(log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [PY, "-m", "app.server", "--host", "127.0.0.1", "--port", str(port), "--store", store],
+        cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT,
+    )
+    return proc, logf
+
+
+def phase_smoke(rep: Report, port: int, base_url: str | None) -> bool:
+    rep.section("阶段 3/3 健康与业务 API/HTTP 路径冒烟")
+
+    workdir = tempfile.mkdtemp(prefix="nav-verify-")
+    store = os.path.join(workdir, "state.json")
+    log_path = os.path.join(workdir, "server.log")
+
+    if port == 0:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+
+    proc, logf = start_local_server(port, store, log_path)
+    try:
+        if not wait_healthy(base):
+            rep.check(False, f"本地服务在 127.0.0.1:{port} 启动并通过健康检查")
+            try:
+                with open(log_path, encoding="utf-8") as fh:
+                    print(fh.read()[-2000:])
+            except OSError:
+                pass
+            rep.section_result("冒烟", False)
+            return False
+        rep.check(True, f"本地服务在 127.0.0.1:{port} 启动并通过健康检查")
+
+        state_final = smoke_business_api(base, rep)
+
+        # 重开恢复：关停进程，用同一持久化存储重启，日志与轨迹必须相同
+        if state_final is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            proc.wait()
+            logf.close()
+
+            proc2, logf2 = start_local_server(port, store, log_path + ".2")
+            try:
+                rep.check(wait_healthy(base), "重开后服务恢复健康")
+                _, reopened_raw, _ = http_get(base + "/api/state")
+                reopened = json.loads(reopened_raw)
+                same_log = reopened.get("log") == state_final.get("log")
+                same_traj = reopened.get("trajectory") == state_final.get("trajectory")
+                same_rev = reopened.get("revision") == state_final.get("revision")
+                rep.check(same_log, "重开后恢复相同的不可变观测日志")
+                rep.check(same_traj, "重开后恢复相同的已发布轨迹（含封存点）")
+                rep.check(same_rev,
+                          f"重开后修订号一致（{reopened.get('revision')} == {state_final.get('revision')}）")
+                # 恢复后规则仍生效：回放 + 新接受
+                code, r = http_post(base + "/api/observations",
+                                    {"stable_id": "SLATE", "timestamp": 2.5, "x": 2.5, "y": 0.3})
+                rep.check(code == 200 and r["decision"] == "replayed",
+                          "重开后同标识同内容依旧回放原结论", f"HTTP {code} {r.get('decision')}")
+            finally:
+                proc2.terminate()
+                try:
+                    proc2.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc2.kill()
+                proc2.wait()
+                logf2.close()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        logf.close()
+
+    # 对已运行实例（如 Compose app 服务）追加冒烟
+    if base_url:
+        base_url = base_url.rstrip("/")
+        print(f"\n  --- 对已运行实例 {base_url} 追加冒烟 ---")
+        if not wait_healthy(base_url):
+            rep.check(False, f"远程实例 {base_url}/healthz 可达")
+        else:
+            rep.check(True, f"远程实例 {base_url}/healthz 健康")
+            code, body, _ = http_get(base_url + "/")
+            rep.check(code == 200 and "固定滞后平滑器" in body.decode("utf-8", "replace"),
+                      "远程实例页面可交付", f"HTTP {code}")
+            code, body, _ = http_get(base_url + "/api/state")
+            try:
+                remote_state = json.loads(body)
+            except json.JSONDecodeError:
+                remote_state = {}
+            rep.check(code == 200 and "revision" in remote_state,
+                      "远程实例 /api/state 可投影", f"HTTP {code}")
+            code, _, _ = http_get(base_url + "/api/trajectory")
+            rep.check(code == 200, "远程实例 /api/trajectory 可投影", f"HTTP {code}")
+
+    ok = not rep.failures
+    rep.section_result("冒烟", ok)
+    return ok
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="导航审查验收服务")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("VERIFY_PORT", "0")),
+                        help="本地冒烟服务端口（0=自动选择）")
+    parser.add_argument("--base-url", default=os.environ.get("SMOKE_BASE_URL", ""),
+                        help="额外冒烟的已运行实例地址（如 http://app:8080）")
+    args = parser.parse_args()
+
+    print("导航审查 · 固定滞后平滑器 —— 验收服务 verify")
+    print(f"工作目录: {ROOT}")
+
+    rep = Report()
+    ok1 = phase_code_tests(rep)
+    ok2 = phase_build(rep)
+    ok3 = phase_smoke(rep, args.port, args.base_url or None)
+
+    print("\n================ 验收汇总 ================")
+    print(f"检查项: {rep.steps}，失败: {len(rep.failures)}")
+    if rep.failures:
+        for f in rep.failures:
+            print(f"  ✗ {f}")
+    passed = ok1 and ok2 and ok3
+    print(f"\n结论: {'验收通过 ✅' if passed else '验收失败 ❌'}")
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
